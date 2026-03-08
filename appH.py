@@ -9,6 +9,7 @@ Usage:
 """
 
 import json
+import os
 import pickle
 from pathlib import Path
 
@@ -26,7 +27,7 @@ ROR_FILE = CACHE_DIR / "ror_signals.parquet"
 GRAPH_FILE = CACHE_DIR / "graph_data.pkl"
 MODEL_FILE = CACHE_DIR / "gnn_model.pkl"
 DRUGS_FILE = CACHE_DIR / "all_drugs.json"
-DRUGBANK_FILE = CACHE_DIR / "drugbank_interactions.csv"
+DRUGBANK_FILE = CACHE_DIR / "drugbank_clean.csv"
 
 DANGEROUS_REACTIONS = {
     "rhabdomyolysis", "qt prolongation", "serotonin syndrome",
@@ -35,6 +36,13 @@ DANGEROUS_REACTIONS = {
     "haemorrhage", "ventricular fibrillation", "hypoglycaemia",
     "respiratory failure", "pulmonary embolism",
 }
+
+LLM_SYSTEM_PROMPT = (
+    "You are a careful, knowledgeable clinical pharmacology assistant. "
+    "You communicate statistical drug safety signals clearly to patients. "
+    "You always remind users to consult their healthcare provider. "
+    "You never diagnose or prescribe."
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -55,23 +63,80 @@ def load_ror_signals():
     """Load precomputed ROR signals."""
     if not ROR_FILE.exists():
         return pd.DataFrame()
-    return pd.read_parquet(ROR_FILE)
+    df = pd.read_parquet(ROR_FILE)
+
+    # Normalize column names for compatibility between pipeline versions
+    # pipeline2.py uses: ci_lower, ci_upper
+    # pipeline3.py uses: ror_ci_lower, ror_ci_upper
+    if "ror_ci_lower" in df.columns and "ci_lower" not in df.columns:
+        df["ci_lower"] = df["ror_ci_lower"]
+    if "ror_ci_upper" in df.columns and "ci_upper" not in df.columns:
+        df["ci_upper"] = df["ror_ci_upper"]
+
+    return df
 
 
 @st.cache_data
 def load_known_interactions():
-    """Load DrugBank known interactions."""
+    """
+    Load known drug-drug interactions from DrugBank.
+
+    The drugbank_clean.csv file has columns including:
+    - drugbank-id: The DrugBank ID (e.g., DB00001)
+    - name: The drug name (e.g., Lepirudin)
+    - drug-interactions: Space-separated list of DrugBank IDs that interact with this drug
+
+    Returns a set of frozensets containing drug name pairs (lowercase).
+    """
     if not DRUGBANK_FILE.exists():
         return set()
-    db = pd.read_csv(DRUGBANK_FILE)
+
+    try:
+        # Read only the columns we need to save memory
+        db = pd.read_csv(DRUGBANK_FILE, usecols=["drugbank-id", "name", "drug-interactions"],
+                         dtype=str, low_memory=False)
+    except (ValueError, KeyError):
+        # Fallback: try old format with Drug1/Drug2 columns
+        try:
+            db = pd.read_csv(DRUGBANK_FILE)
+            known = set()
+            for _, row in db.iterrows():
+                a = str(row.get("Drug1", "")).lower().strip()
+                b = str(row.get("Drug2", "")).lower().strip()
+                if a and b:
+                    known.add(frozenset([a, b]))
+            return known
+        except Exception:
+            return set()
+
+    # Build DrugBank ID -> drug name mapping
+    id_to_name = {}
+    for _, row in db.iterrows():
+        db_id = str(row.get("drugbank-id", "")).strip()
+        name = str(row.get("name", "")).lower().strip()
+        if db_id and name and db_id != "nan" and name != "nan":
+            id_to_name[db_id] = name
+
+    # Parse interactions and build set of drug name pairs
     known = set()
     for _, row in db.iterrows():
-        a = str(row.get("Drug1", "")).lower().strip()
-        b = str(row.get("Drug2", "")).lower().strip()
-        if a and b:
-            known.add(frozenset([a, b]))
-    return known
+        drug_name = str(row.get("name", "")).lower().strip()
+        interactions_str = str(row.get("drug-interactions", ""))
 
+        if not drug_name or drug_name == "nan" or not interactions_str or interactions_str == "nan":
+            continue
+
+        # Parse space-separated DrugBank IDs
+        interaction_ids = interactions_str.split()
+
+        for interact_id in interaction_ids:
+            interact_id = interact_id.strip()
+            if interact_id in id_to_name:
+                interact_name = id_to_name[interact_id]
+                if drug_name != interact_name:  # Avoid self-interactions
+                    known.add(frozenset([drug_name, interact_name]))
+
+    return known
 
 @st.cache_resource
 def load_gnn_predictor():
@@ -149,6 +214,145 @@ def predict_gnn_score(predictor, drug_a: str, drug_b: str) -> float | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# LLM BACKENDS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _stream_ollama(prompt: str, model: str, placeholder):
+    """Stream response from local Ollama server."""
+    import requests
+    import json as _json
+
+    try:
+        resp = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model":  model,
+                "prompt": prompt,
+                "system": LLM_SYSTEM_PROMPT,
+                "stream": True,
+            },
+            stream=True,
+            timeout=120,
+        )
+        resp.raise_for_status()
+    except requests.exceptions.ConnectionError:
+        st.error(
+            "Could not connect to Ollama. Make sure it is running:\n\n"
+            "```bash\nollama serve\n```"
+        )
+        return ""
+
+    full = ""
+    for line in resp.iter_lines():
+        if line:
+            chunk = _json.loads(line)
+            full += chunk.get("response", "")
+            placeholder.markdown(full + "▌")
+            if chunk.get("done"):
+                break
+
+    placeholder.markdown(full)
+    return full
+
+
+def _stream_groq(prompt: str, model: str, placeholder):
+    """Stream response from Groq cloud API."""
+    try:
+        from groq import Groq
+    except ImportError:
+        st.error("Run `pip install groq` to use the Groq backend.")
+        return ""
+
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        st.error(
+            "GROQ_API_KEY not set.\n\n"
+            "```bash\nexport GROQ_API_KEY=gsk_your_key_here\n```"
+        )
+        return ""
+
+    client = Groq(api_key=api_key)
+    stream = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": LLM_SYSTEM_PROMPT},
+            {"role": "user",   "content": prompt},
+        ],
+        max_tokens=1500,
+        stream=True,
+    )
+
+    full = ""
+    for chunk in stream:
+        delta = chunk.choices[0].delta.content or ""
+        full += delta
+        placeholder.markdown(full + "▌")
+
+    placeholder.markdown(full)
+    return full
+
+
+def run_llm(prompt: str, backend: str, model: str, placeholder) -> str:
+    """Dispatch to the selected LLM backend."""
+    if backend == "Ollama (local)":
+        return _stream_ollama(prompt, model, placeholder)
+    elif backend == "Groq (cloud)":
+        return _stream_groq(prompt, model, placeholder)
+    return ""
+
+
+def build_medication_prompt(my_drugs: list, pair_signals: pd.DataFrame,
+                             patient_context: str) -> str:
+    """Build the prompt for the LLM to analyse medication risks."""
+    if pair_signals.empty:
+        signals_text = (
+            "No statistically significant drug-drug interaction signals "
+            "were found in the FAERS database for any pair in this list."
+        )
+    else:
+        sort_col = "ic025" if "ic025" in pair_signals.columns else "ror"
+        if sort_col in pair_signals.columns:
+            top = pair_signals.sort_values(sort_col, ascending=False).head(30)
+        else:
+            top = pair_signals.head(30)
+        rows = []
+        for _, row in top.iterrows():
+            ror_val = row.get("ror", "N/A")
+            ror_str = f"ROR={ror_val:.2f}" if isinstance(ror_val, (int, float)) else f"ROR={ror_val}"
+            n_cases = row.get("n_cases", "?")
+            danger  = " !! DANGEROUS" if row.get("is_dangerous") else ""
+            rows.append(
+                f"  - {row['drug_a']} + {row['drug_b']} -> {row['reaction']}"
+                f" ({ror_str}, n={n_cases}){danger}"
+            )
+        signals_text = "\n".join(rows)
+
+    context_block = (
+        f"\nPatient context: {patient_context.strip()}"
+        if patient_context and patient_context.strip() else ""
+    )
+
+    return f"""You are a clinical pharmacology assistant helping a patient understand \
+their medication risks based on FDA FAERS adverse event data.
+
+The patient is currently taking: {', '.join(my_drugs)}.{context_block}
+
+The following drug-drug interaction signals were detected in the FAERS database \
+(ROR = Reporting Odds Ratio, values > 2 indicate elevated risk):
+
+{signals_text}
+
+Please provide:
+1. A plain-language summary of the most important risks for this specific combination
+2. Which pairs are most concerning and why (prioritise dangerous reactions)
+3. Any drug classes or specific drugs they may want to discuss avoiding with their doctor
+4. A clear reminder that this is based on statistical signals from adverse event reports, \
+not clinical trial evidence, and they should consult their prescriber before making any changes
+
+Keep the tone clear, calm, and empowering — not alarmist. Use plain English. Avoid jargon."""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -190,7 +394,7 @@ def render_lookup_results(pair_signals, gnn_score, is_novel, drug_a, drug_b):
     )
 
     # ── Narrative summary ────────────────────────────────────────────────────
-    if n_signals > 0:
+    if n_signals > 0 and "ror" in pair_signals.columns:
         top = pair_signals.sort_values("ror", ascending=False).iloc[0]
         danger_note = (
             f" **{n_dangerous} of these are classified as dangerous reactions.**"
@@ -201,10 +405,14 @@ def render_lookup_results(pair_signals, gnn_score, is_novel, drug_a, drug_b):
             if is_novel else
             " This pair is already documented in DrugBank."
         )
+        # Build CI string if columns exist
+        ci_str = ""
+        if "ci_lower" in top and "ci_upper" in top:
+            ci_str = f", 95% CI {top['ci_lower']:.1f}–{top['ci_upper']:.1f}"
         st.info(
             f"**{drug_a.title()} + {drug_b.title()}** has **{n_signals}** flagged reaction(s)."
             f" The strongest signal is **{top['reaction']}** "
-            f"(ROR {top['ror']:.1f}, 95% CI {top['ci_lower']:.1f}–{top['ci_upper']:.1f}, "
+            f"(ROR {top['ror']:.1f}{ci_str}, "
             f"n={int(top['n_cases'])})."
             f"{danger_note}{novel_note}"
         )
@@ -217,9 +425,12 @@ def render_lookup_results(pair_signals, gnn_score, is_novel, drug_a, drug_b):
     # ── Signals table ────────────────────────────────────────────────────────
     if not pair_signals.empty:
         st.subheader("Reaction signals")
-        display_df = pair_signals[
-            ["reaction", "ror", "ci_lower", "ci_upper", "n_cases", "is_dangerous"]
-        ].sort_values("ror", ascending=False).copy()
+        # Select only columns that exist
+        display_cols = ["reaction", "ror", "ci_lower", "ci_upper", "n_cases", "is_dangerous"]
+        display_cols = [c for c in display_cols if c in pair_signals.columns]
+        display_df = pair_signals[display_cols].copy()
+        if "ror" in display_df.columns:
+            display_df = display_df.sort_values("ror", ascending=False)
         display_df["is_dangerous"] = display_df["is_dangerous"].apply(
             lambda x: "⚠️ Yes" if x else ""
         )
@@ -301,11 +512,38 @@ def main():
     )
     only_dangerous = st.sidebar.checkbox("Only dangerous reactions", value=False)
     only_novel     = st.sidebar.checkbox("Only novel (not in DrugBank)", value=False)
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("AI Assistant")
+    llm_backend = st.sidebar.radio(
+        "LLM Backend",
+        ["Ollama (local)", "Groq (cloud)"],
+        help=(
+            "Ollama: free, runs locally, fully private. "
+            "Requires `ollama serve` to be running.\n\n"
+            "Groq: free cloud API, faster. Requires GROQ_API_KEY."
+        ),
+    )
+
+    if llm_backend == "Ollama (local)":
+        llm_model = st.sidebar.selectbox(
+            "Model",
+            ["llama3", "llama3:8b", "llama3:70b", "mistral", "mixtral", "phi3", "gemma2"],
+            help="Run `ollama pull <model>` to download a model first.",
+        )
+    else:
+        llm_model = st.sidebar.selectbox(
+            "Model",
+            ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768", "gemma2-9b-it"],
+        )
+
     st.sidebar.markdown("---")
     st.sidebar.caption(f"GNN model: {'✅ loaded' if predictor else '❌ not found'}")
 
     # ── Tabs ──────────────────────────────────────────────────────────────────
-    tab1, tab2, tab3, tab4 = st.tabs(["Drug Pair Lookup", "Signal Table", "Network", "Summary"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "Drug Pair Lookup", "Signal Table", "Network", "Summary", "My Medications"
+    ])
 
     # ─────────────────────────────────────────────────────────────────────────
     # TAB 1 — Drug Pair Lookup
@@ -528,11 +766,13 @@ def main():
                         clicked_drug = node_list[clicked_idx]
 
                         # Find the partner with the highest ROR for this drug
-                        if not ror_df.empty:
+                        if not ror_df.empty and "ror" in ror_df.columns:
                             drug_rows = ror_df[
                                 (ror_df["drug_a"] == clicked_drug) |
                                 (ror_df["drug_b"] == clicked_drug)
-                            ].sort_values("ror", ascending=False)
+                            ]
+                            if not drug_rows.empty:
+                                drug_rows = drug_rows.sort_values("ror", ascending=False)
 
                             if not drug_rows.empty:
                                 top_row   = drug_rows.iloc[0]
@@ -642,14 +882,18 @@ def main():
                 "Signals that are both classified as dangerous AND absent from DrugBank — "
                 "the most clinically significant findings."
             )
-            if known_interactions and "is_dangerous" in ror_df.columns:
+            if known_interactions and "is_dangerous" in ror_df.columns and "ror" in ror_df.columns:
                 dang_novel = ror_df[ror_df["is_dangerous"]].copy()
                 dang_novel = dang_novel[
                     dang_novel.apply(
                         lambda r: frozenset([r["drug_a"], r["drug_b"]]) not in known_interactions,
                         axis=1,
                     )
-                ].sort_values("ror", ascending=False).head(20)
+                ]
+                if not dang_novel.empty and "ror" in dang_novel.columns:
+                    dang_novel = dang_novel.sort_values("ror", ascending=False).head(20)
+                else:
+                    dang_novel = dang_novel.head(20)
 
                 if dang_novel.empty:
                     st.info("No dangerous novel signals found under current filters.")
@@ -674,6 +918,137 @@ def main():
                     )
             else:
                 st.info("Load DrugBank data to see novel signal filtering.")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # TAB 5 — My Medications
+    # ─────────────────────────────────────────────────────────────────────────
+    with tab5:
+        st.subheader("My Medication Risk Summary")
+        st.caption(
+            "Select the drugs you are currently taking. "
+            "The AI will analyse all pairwise signals and summarise your risks in plain language."
+        )
+
+        my_drugs = st.multiselect(
+            "My current medications",
+            options=all_drugs,
+            placeholder="Start typing a drug name...",
+            help="Select all drugs you are currently taking, including supplements.",
+        )
+
+        with st.expander("Add personal context (optional)"):
+            patient_context = st.text_area(
+                "Any relevant medical context",
+                placeholder="e.g. 65 year old, kidney disease, recently diagnosed with...",
+                height=80,
+            )
+
+        # LLM status indicator
+        if llm_backend == "Ollama (local)":
+            st.info(
+                f"Using **Ollama** with model `{llm_model}`. "
+                f"Make sure Ollama is running (`ollama serve`) and the model is downloaded "
+                f"(`ollama pull {llm_model}`).",
+            )
+        else:
+            groq_key_set = bool(os.environ.get("GROQ_API_KEY"))
+            if groq_key_set:
+                st.info(f"Using **Groq** with model `{llm_model}`. API key configured.")
+            else:
+                st.warning(
+                    f"Using **Groq** with model `{llm_model}`. "
+                    "GROQ_API_KEY not set — run `export GROQ_API_KEY=gsk_...` before starting Streamlit."
+                )
+
+        analyse_btn = st.button(
+            "Analyse My Medications",
+            type="primary",
+            disabled=len(my_drugs) < 1,
+        )
+
+        if analyse_btn and my_drugs:
+            # ── Gather pairwise signals ───────────────────────────────────────
+            my_drugs_lower = [d.lower().strip() for d in my_drugs]
+
+            if ror_df.empty:
+                pair_signals = pd.DataFrame()
+            else:
+                mask = pd.Series(False, index=ror_df.index)
+                for i, da in enumerate(my_drugs_lower):
+                    for db in my_drugs_lower[i + 1:]:
+                        mask |= (
+                            ((ror_df["drug_a"] == da) & (ror_df["drug_b"] == db)) |
+                            ((ror_df["drug_a"] == db) & (ror_df["drug_b"] == da))
+                        )
+                pair_signals = ror_df[mask].copy()
+
+            # ── Stats row ─────────────────────────────────────────────────────
+            n_pairs   = len(my_drugs) * (len(my_drugs) - 1) // 2
+            n_signals = len(pair_signals)
+            n_danger  = int(pair_signals["is_dangerous"].sum()) if not pair_signals.empty and "is_dangerous" in pair_signals.columns else 0
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Drug pairs checked", n_pairs)
+            c2.metric("Signals found", n_signals)
+            c3.metric(
+                "Dangerous reactions", n_danger,
+                delta="⚠️ Review" if n_danger > 0 else None,
+                delta_color="inverse",
+            )
+
+            # ── Raw signal data expander ──────────────────────────────────────
+            if not pair_signals.empty:
+                with st.expander("View raw signal data"):
+                    show_cols = [c for c in
+                                 ["drug_a", "drug_b", "reaction", "ror", "ci_lower", "ci_upper",
+                                  "n_cases", "is_dangerous"]
+                                 if c in pair_signals.columns]
+                    display_df = pair_signals[show_cols].copy()
+                    if "ror" in display_df.columns:
+                        display_df = display_df.sort_values("ror", ascending=False)
+                    if "is_dangerous" in display_df.columns:
+                        display_df["is_dangerous"] = display_df["is_dangerous"].apply(
+                            lambda x: "⚠️ Yes" if x else ""
+                        )
+                    st.dataframe(
+                        display_df,
+                        use_container_width=True,
+                        column_config={
+                            "ror":          st.column_config.NumberColumn("ROR",      format="%.2f"),
+                            "ci_lower":     st.column_config.NumberColumn("CI Lower", format="%.2f"),
+                            "ci_upper":     st.column_config.NumberColumn("CI Upper", format="%.2f"),
+                            "is_dangerous": st.column_config.TextColumn("Dangerous"),
+                        },
+                    )
+            else:
+                st.info(
+                    "No signals found for any pair in your medication list. "
+                    "The AI will still provide general guidance."
+                )
+
+            # ── Build prompt and run LLM ──────────────────────────────────────
+            prompt = build_medication_prompt(my_drugs, pair_signals, patient_context)
+
+            st.divider()
+            st.markdown(
+                f"#### AI Risk Summary "
+                f"<small style='color:#00e9ab'>({llm_backend} · {llm_model})</small>",
+                unsafe_allow_html=True,
+            )
+
+            placeholder = st.empty()
+
+            with st.spinner("Generating summary..."):
+                run_llm(prompt, llm_backend, llm_model, placeholder)
+
+            # Disclaimer
+            st.divider()
+            st.warning(
+                "**Medical disclaimer**: This analysis is based on statistical patterns "
+                "in FDA adverse event reports. It is not a substitute for professional "
+                "medical advice. Always consult your doctor or pharmacist before "
+                "changing your medications."
+            )
 
 
 if __name__ == "__main__":
