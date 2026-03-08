@@ -25,7 +25,7 @@ import plotly.graph_objects as go
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
-CACHE_DIR    = Path("faers_cache")
+CACHE_DIR    = Path("faers_cache_3")
 REPORTS_FILE = CACHE_DIR / "reports.parquet"
 ROR_FILE     = CACHE_DIR / "ror_signals.parquet"
 GRAPH_FILE   = CACHE_DIR / "graph_data.pkl"
@@ -249,7 +249,7 @@ def load_gnn_predictor():
     try:
         import torch
         import torch.nn.functional as F
-        from torch_geometric.nn import GCNConv
+        from torch_geometric.nn import GATConv
 
         with open(GRAPH_FILE, "rb") as f:
             graph_data = pickle.load(f)
@@ -258,26 +258,66 @@ def load_gnn_predictor():
 
         in_ch = graph_data.x.shape[1]
 
-        class GCN(torch.nn.Module):
+        # GAT architecture must match what was saved in pipeline4.py
+        # Uses bilinear decoder for better interaction modeling
+        class GAT(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.conv1 = GCNConv(in_ch, 64)
-                self.conv2 = GCNConv(64, 32)
-                self.head  = torch.nn.Linear(64, 1)
+                # Layer 1: 4 attention heads, each producing 16-dim output → 64-dim
+                self.conv1 = GATConv(in_ch, 16, heads=4, dropout=0.0)  # No dropout at inference
+                # Layer 2: 4 attention heads averaged → 32-dim output
+                self.conv2 = GATConv(16 * 4, 32, heads=4, concat=False, dropout=0.0)
+
+                # Bilinear interaction layer: z_a^T W z_b
+                self.bilinear = torch.nn.Bilinear(32, 32, 16)
+
+                # MLP decoder on combined features:
+                # [z_a (32) | z_b (32) | z_a*z_b (32) | bilinear(16)] = 112-dim
+                self.decoder = torch.nn.Sequential(
+                    torch.nn.Linear(112, 64),
+                    torch.nn.ReLU(),
+                    torch.nn.Dropout(0.0),  # No dropout at inference
+                    torch.nn.Linear(64, 32),
+                    torch.nn.ReLU(),
+                    torch.nn.Dropout(0.0),
+                    torch.nn.Linear(32, 1),
+                )
 
             def encode(self, x, edge_index):
-                x = F.relu(self.conv1(x, edge_index))
-                return self.conv2(x, edge_index)
+                x = F.elu(self.conv1(x, edge_index))
+                x = self.conv2(x, edge_index)
+                return x
 
             def decode(self, z, src, dst):
-                return torch.sigmoid(self.head(torch.cat([z[src], z[dst]], dim=-1)))
+                z_a = z[src]  # (batch, 32)
+                z_b = z[dst]  # (batch, 32)
 
-        model = GCN()
+                # Bilinear interaction
+                bilin = self.bilinear(z_a, z_b)  # (batch, 16)
+
+                # Element-wise product
+                hadamard = z_a * z_b  # (batch, 32)
+
+                # Concatenate all features
+                combined = torch.cat([z_a, z_b, hadamard, bilin], dim=-1)  # (batch, 112)
+
+                return torch.sigmoid(self.decoder(combined))
+
+        model = GAT()
         model.load_state_dict(model_data["state_dict"])
         model.eval()
-        return {"model": model, "graph": graph_data, "drug_to_idx": model_data["drug_to_idx"]}
+
+        # Include training info if available (for debugging/display)
+        result = {
+            "model": model,
+            "graph": graph_data,
+            "drug_to_idx": model_data["drug_to_idx"],
+        }
+        if "training_info" in model_data:
+            result["training_info"] = model_data["training_info"]
+        return result
     except Exception as e:
-        st.warning(f"Could not load GNN model: {e}")
+        st.warning(f"Could not load GAT model: {e}")
         return None
 
 
@@ -294,6 +334,54 @@ def predict_gnn_score(predictor, drug_a, drug_b):
         src = torch.tensor([d2i[drug_a]])
         dst = torch.tensor([d2i[drug_b]])
         return round(model.decode(z, src, dst).item(), 4)
+
+
+@st.cache_data
+def compute_all_gat_scores(_predictor, drug_pairs: list) -> dict:
+    """
+    Batch-compute GAT scores for a list of drug pairs.
+    Encodes the graph once and predicts all pairs efficiently.
+
+    Args:
+        _predictor: The loaded predictor dict (underscore prefix for unhashable)
+        drug_pairs: List of (drug_a, drug_b) tuples
+
+    Returns:
+        Dict mapping (drug_a, drug_b) -> score
+    """
+    if _predictor is None:
+        return {}
+
+    import torch
+    d2i = _predictor["drug_to_idx"]
+    model, graph = _predictor["model"], _predictor["graph"]
+
+    # Filter to valid pairs and build index tensors
+    valid_pairs = []
+    src_indices = []
+    dst_indices = []
+
+    for drug_a, drug_b in drug_pairs:
+        if drug_a in d2i and drug_b in d2i:
+            valid_pairs.append((drug_a, drug_b))
+            src_indices.append(d2i[drug_a])
+            dst_indices.append(d2i[drug_b])
+
+    if not valid_pairs:
+        return {}
+
+    # Batch prediction
+    with torch.no_grad():
+        z = model.encode(graph.x, graph.edge_index)
+        src = torch.tensor(src_indices, dtype=torch.long)
+        dst = torch.tensor(dst_indices, dtype=torch.long)
+        scores = model.decode(z, src, dst).squeeze().cpu().numpy()
+
+    # Handle single prediction case
+    if scores.ndim == 0:
+        scores = [float(scores)]
+
+    return {pair: round(float(score), 4) for pair, score in zip(valid_pairs, scores)}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -406,11 +494,16 @@ def render_lookup_results(pair_signals, gnn_score, is_novel, db_description, dru
     colA, colB, colC = st.columns(3)
     colA.metric("ROR signals found", n_signals,
                 help="Number of adverse reactions with elevated ROR > 2.")
-    colB.metric("GNN risk score",
+    colB.metric("GAT risk score",
                 f"{gnn_score:.3f}" if gnn_score is not None else "N/A",
-                help="Graph Neural Network predicted interaction risk (0=low, 1=high).")
+                help=(
+                    "Graph Attention Network predicted interaction risk. "
+                    "Trained on ROR signals: 0.0 = no known risk, "
+                    "0.3+ = moderate signal, 0.6+ = elevated risk, "
+                    "0.8+ = high risk (dangerous reactions)."
+                ))
     colC.metric("Novel (not in DrugBank)",
-                "✅ Yes" if is_novel else "❌ No",
+                "● Yes" if is_novel else "✗ No",
                 help="Whether this pair is absent from the DrugBank known-interactions database.")
 
     if n_signals > 0 and "ror" in pair_signals.columns:
@@ -436,20 +529,26 @@ def render_lookup_results(pair_signals, gnn_score, is_novel, db_description, dru
     if not pair_signals.empty:
         st.subheader("Reaction signals")
         display_cols = [c for c in
-                        ["reaction", "ror", "ci_lower", "ci_upper", "n_cases", "is_dangerous"]
+                        ["reaction", "ror", "ci_lower", "ci_upper", "prr", "ic025", "n_cases", "is_dangerous"]
                         if c in pair_signals.columns]
         display_df = pair_signals[display_cols].copy()
         if "ror" in display_df.columns:
             display_df = display_df.sort_values("ror", ascending=False)
         display_df["is_dangerous"] = display_df["is_dangerous"].apply(
-            lambda x: "⚠️ Yes" if x else "")
+            lambda x: "▲ Yes" if x else "")
         st.dataframe(
             display_df, use_container_width=True,
             column_config={
-                "ror":          st.column_config.NumberColumn("ROR",      format="%.2f"),
+                "ror":          st.column_config.NumberColumn("ROR", format="%.2f",
+                                    help="Reporting Odds Ratio - odds of this reaction with the drug pair vs without"),
                 "ci_lower":     st.column_config.NumberColumn("CI Lower", format="%.2f"),
                 "ci_upper":     st.column_config.NumberColumn("CI Upper", format="%.2f"),
-                "n_cases":      st.column_config.NumberColumn("Reports"),
+                "prr":          st.column_config.NumberColumn("PRR", format="%.2f",
+                                    help="Proportional Reporting Ratio - proportion of reports with this reaction for the pair vs all drugs"),
+                "ic025":        st.column_config.NumberColumn("IC025", format="%.2f",
+                                    help="Information Component lower 95% CI - WHO Uppsala signal criterion (>0 = signal)"),
+                "n_cases":      st.column_config.NumberColumn("Reports",
+                                    help="Number of reports with this drug pair and reaction"),
                 "is_dangerous": st.column_config.TextColumn("Dangerous"),
             },
         )
@@ -475,7 +574,7 @@ def render_pill_scanner(all_drugs: list, api_key: str) -> None:
             margin-bottom: 12px;
         ">
             <div style="display:flex; align-items:center; gap:10px; margin-bottom:6px;">
-                <span style="font-size:1.4rem;">📷</span>
+                <span style="font-size:1.2rem; color:#00e9ab;">⦿</span>
                 <strong style="font-size:1.05rem; color:#00e9ab;">PillScan — Scan a Bottle</strong>
             </div>
             <span style="color:#aaa; font-size:0.88rem;">
@@ -488,7 +587,7 @@ def render_pill_scanner(all_drugs: list, api_key: str) -> None:
     )
 
     if not api_key:
-        st.warning("Enter your **Anthropic API key** in the sidebar to enable PillScan.", icon="🔑")
+        st.warning("Enter your **Anthropic API key** in the sidebar to enable PillScan.")
         return
 
     # ── Camera capture ────────────────────────────────────────────────────────
@@ -499,13 +598,13 @@ def render_pill_scanner(all_drugs: list, api_key: str) -> None:
     )
 
     if camera_image is None:
-        st.caption("💡 Tip: hold the bottle label flat, close to the camera, in good light.")
+        st.caption("Tip: hold the bottle label flat, close to the camera, in good light.")
         return
 
     img_bytes = camera_image.getvalue()
 
     # ── Analyse button ────────────────────────────────────────────────────────
-    if st.button("🔍 Analyse label with Claude", type="primary", key="pillscan_analyse"):
+    if st.button("Analyse label with Claude", type="primary", key="pillscan_analyse"):
         with st.spinner("Reading label…"):
             try:
                 scan_data = scan_pill_image(img_bytes, api_key)
@@ -550,7 +649,7 @@ def render_pill_scanner(all_drugs: list, api_key: str) -> None:
                     {confidence} CONFIDENCE
                 </div>
             </div>
-            {"<div style='margin-top:8px;color:#e0a060;font-size:0.82rem;'>⚠️ " + " &nbsp;|&nbsp; ".join(warnings[:3]) + "</div>" if warnings else ""}
+            {"<div style='margin-top:8px;color:#e0a060;font-size:0.82rem;'>▲ " + " &nbsp;|&nbsp; ".join(warnings[:3]) + "</div>" if warnings else ""}
         </div>
         """,
         unsafe_allow_html=True,
@@ -563,17 +662,17 @@ def render_pill_scanner(all_drugs: list, api_key: str) -> None:
         st.success(f"Matched **{matched.title()}** in the drug database.")
         col_add, col_skip = st.columns([1, 1])
         with col_add:
-            if st.button(f"➕ Add {matched.title()} to my list", key="pillscan_add_matched"):
+            if st.button(f"+ Add {matched.title()} to my list", key="pillscan_add_matched"):
                 # FIX: write directly to session state — never return a value through
                 # st.rerun() because rerun raises StopException before any caller
                 # can receive the return value.
                 if matched not in st.session_state["my_drugs_scanned"]:
                     st.session_state["my_drugs_scanned"].append(matched)
                 st.session_state["last_scan"] = None
-                st.toast(f"✅ {matched.title()} added!", icon="💊")
+                st.toast(f"● {matched.title()} added!")
                 st.rerun()
         with col_skip:
-            if st.button("✕ Skip", key="pillscan_skip"):
+            if st.button("× Skip", key="pillscan_skip"):
                 st.session_state["last_scan"] = None
                 st.rerun()
     else:
@@ -589,15 +688,15 @@ def render_pill_scanner(all_drugs: list, api_key: str) -> None:
         )
         col_add, col_skip = st.columns([1, 1])
         with col_add:
-            if manual and st.button(f"➕ Add {manual.title()}", key="pillscan_add_manual"):
+            if manual and st.button(f"+ Add {manual.title()}", key="pillscan_add_manual"):
                 # FIX: write directly to session state so rerun does not lose the value
                 if manual not in st.session_state["my_drugs_scanned"]:
                     st.session_state["my_drugs_scanned"].append(manual)
                 st.session_state["last_scan"] = None
-                st.toast(f"✅ {manual.title()} added!", icon="💊")
+                st.toast(f"● {manual.title()} added!")
                 st.rerun()
         with col_skip:
-            if st.button("✕ Skip", key="pillscan_skip2"):
+            if st.button("× Skip", key="pillscan_skip2"):
                 st.session_state["last_scan"] = None
                 st.rerun()
 
@@ -607,7 +706,68 @@ def render_pill_scanner(all_drugs: list, api_key: str) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    st.set_page_config(page_title="InteRx", page_icon="💊", layout="wide")
+    st.set_page_config(page_title="InteRx", page_icon=":material/medication:", layout="wide")
+
+    # ── Custom CSS: Supplemental styling ────────────────────────────────────────
+    # Note: Primary mint color (#00e9ab) is set in .streamlit/config.toml
+    # This CSS handles edge cases and ensures consistent styling
+    st.markdown("""
+    <style>
+    /* Primary button text should be dark for contrast */
+    .stButton > button[kind="primary"],
+    button[kind="primary"] {
+        color: #000 !important;
+    }
+
+    /* Download button styling */
+    .stDownloadButton > button {
+        border-color: #00e9ab !important;
+        color: #00e9ab !important;
+    }
+    .stDownloadButton > button:hover {
+        background-color: rgba(0, 233, 171, 0.1) !important;
+    }
+
+    /* Links */
+    a {
+        color: #00e9ab !important;
+    }
+
+    /* Expander hover */
+    .streamlit-expanderHeader:hover,
+    details summary:hover {
+        color: #00e9ab !important;
+    }
+
+    /* Logo dark/light mode switching */
+    .logo-dark { display: block; }
+    .logo-light { display: none; }
+
+    @media (prefers-color-scheme: light) {
+        .logo-dark { display: none; }
+        .logo-light { display: block; }
+    }
+
+    .logo-container {
+        margin-bottom: 0.5rem;
+        display: flex;
+        justify-content: center;
+        width: 100%;
+    }
+    .logo-container img {
+        max-height: 400px;
+        width: auto;
+    }
+
+    /* Custom icon styles */
+    .icon { font-style: normal; font-weight: 600; }
+    .icon-mint { color: #00e9ab; }
+    .icon-red { color: #ff6b6b; }
+    .icon-amber { color: #e0a060; }
+    .icon-blue { color: #4a9eff; }
+    .icon-gray { color: #888; }
+    </style>
+    """, unsafe_allow_html=True)
 
     # ── Session state ─────────────────────────────────────────────────────────
     for key, default in {
@@ -622,7 +782,22 @@ def main():
             st.session_state[key] = default
 
     # ── Header ────────────────────────────────────────────────────────────────
-    st.title("InteRx")
+    # Load and display logo with dark/light mode support
+    logo_dark_path = Path("InteRx_dark.png")
+    logo_light_path = Path("InteRx.png")  # Use main logo for light mode
+
+    if logo_dark_path.exists() and logo_light_path.exists():
+        logo_dark_b64 = base64.b64encode(logo_dark_path.read_bytes()).decode()
+        logo_light_b64 = base64.b64encode(logo_light_path.read_bytes()).decode()
+        st.markdown(f"""
+        <div class="logo-container">
+            <img src="data:image/png;base64,{logo_dark_b64}" class="logo-dark" alt="InteRx">
+            <img src="data:image/png;base64,{logo_light_b64}" class="logo-light" alt="InteRx">
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.title("InteRx")
+
     st.caption("Uncovering hidden drug-drug interactions from FDA FAERS data")
 
     if not DRUGS_FILE.exists():
@@ -694,11 +869,11 @@ def main():
     )
 
     st.sidebar.markdown("---")
-    pillscan_status = "✅ ready" if anthropic_key else "❌ no API key"
-    groq_status     = "✅ ready" if groq_key      else "❌ no API key"
+    pillscan_status = "● ready" if anthropic_key else "✗ no API key"
+    groq_status     = "● ready" if groq_key      else "✗ no API key"
     st.sidebar.caption(f"PillScan:  {pillscan_status}")
     st.sidebar.caption(f"Groq:      {groq_status}")
-    st.sidebar.caption(f"GNN model: {'✅ loaded' if predictor else '❌ not found'}")
+    st.sidebar.caption(f"GAT model: {'● loaded' if predictor else '✗ not found'}")
     st.sidebar.caption(f"DrugBank pairs: {len(known_interactions):,}")
 
     # ── Tabs ──────────────────────────────────────────────────────────────────
@@ -751,35 +926,97 @@ def main():
                 filtered = filtered[filtered.apply(
                     lambda r: frozenset([r["drug_a"], r["drug_b"]]) not in known_interactions, axis=1)]
 
+            # ── Add GAT scores for each drug pair (batch, cached) ────────────
+            if predictor is not None and not filtered.empty:
+                # Get unique drug pairs for batch prediction
+                drug_pairs = list(set(
+                    (row["drug_a"], row["drug_b"])
+                    for _, row in filtered.iterrows()
+                ))
+                # Batch compute scores (cached)
+                pair_scores = compute_all_gat_scores(predictor, drug_pairs)
+                # Map back to dataframe rows
+                filtered["gat_score"] = filtered.apply(
+                    lambda r: pair_scores.get((r["drug_a"], r["drug_b"])),
+                    axis=1
+                )
+            else:
+                filtered["gat_score"] = None
+
+            # ── Sorting options ──────────────────────────────────────────────
+            sort_col1, sort_col2 = st.columns([2, 4])
+            with sort_col1:
+                sort_options = ["ROR (highest)", "GAT Score (highest)", "IC025 (highest)", "Cases (most)"]
+                sort_by = st.selectbox("Sort by", sort_options, index=0, key="signal_sort")
+
+            # Map selection to column and sort
+            sort_map = {
+                "ROR (highest)": ("ror", False),
+                "GAT Score (highest)": ("gat_score", False),
+                "IC025 (highest)": ("ic025", False),
+                "Cases (most)": ("n_cases", False),
+            }
+            sort_column, ascending = sort_map.get(sort_by, ("ror", False))
+
+            # Handle missing GAT scores
+            if sort_column == "gat_score" and filtered["gat_score"].isna().all():
+                st.warning("GAT scores not available. Falling back to ROR sorting.")
+                sort_column = "ror"
+
+            if sort_column in filtered.columns:
+                filtered = filtered.sort_values(sort_column, ascending=ascending, na_position="last")
+
             st.subheader(f"{len(filtered)} signals (ROR ≥ {min_ror})")
-            st.download_button("⬇️ Export as CSV",
+            st.download_button("↓ Export as CSV",
                                data=filtered.to_csv(index=False).encode("utf-8"),
                                file_name="interx_signals.csv", mime="text/csv")
 
             display = filtered.copy()
             if "is_dangerous" in display.columns:
-                display["is_dangerous"] = display["is_dangerous"].apply(lambda x: "⚠️ Yes" if x else "")
+                display["is_dangerous"] = display["is_dangerous"].apply(lambda x: "▲ Yes" if x else "")
             st.dataframe(display, use_container_width=True,
                          column_config={
                              "ror":          st.column_config.NumberColumn("ROR",      format="%.2f"),
                              "ci_lower":     st.column_config.NumberColumn("CI Lower", format="%.2f"),
                              "ci_upper":     st.column_config.NumberColumn("CI Upper", format="%.2f"),
+                             "gat_score":    st.column_config.NumberColumn("GAT Score", format="%.3f"),
                              "is_dangerous": st.column_config.TextColumn("Dangerous"),
                          })
 
-            top10 = filtered.nlargest(10, "ror") if not filtered.empty else pd.DataFrame()
+            # ── Top 10 chart (respects current sort) ─────────────────────────
+            top10 = filtered.head(10) if not filtered.empty else pd.DataFrame()
             if not top10.empty:
+                # Use the current sort column for the chart
+                if sort_column == "gat_score" and "gat_score" in top10.columns:
+                    chart_x = top10["gat_score"].fillna(0)
+                    chart_title = "Top 10 signals by GAT Score"
+                    x_title = "GAT Risk Score"
+                    # No error bars for GAT score
+                    error_x = None
+                elif sort_column == "ic025" and "ic025" in top10.columns:
+                    chart_x = top10["ic025"]
+                    chart_title = "Top 10 signals by IC025"
+                    x_title = "Information Component (IC025)"
+                    error_x = None
+                else:
+                    chart_x = top10["ror"]
+                    chart_title = "Top 10 signals by ROR"
+                    x_title = "Reporting Odds Ratio"
+                    error_x = dict(
+                        type="data",
+                        array=top10["ci_upper"] - top10["ror"],
+                        arrayminus=top10["ror"] - top10["ci_lower"],
+                        visible=True
+                    ) if "ci_upper" in top10.columns else None
+
                 fig = go.Figure(go.Bar(
-                    x=top10["ror"],
+                    x=chart_x,
                     y=top10["drug_a"] + " + " + top10["drug_b"] + " → " + top10["reaction"],
                     orientation="h", marker_color="#00e9ab",
-                    error_x=dict(type="data",
-                                 array=top10["ci_upper"] - top10["ror"],
-                                 arrayminus=top10["ror"] - top10["ci_lower"],
-                                 visible=True),
+                    error_x=error_x,
                 ))
                 fig.update_layout(
-                    title="Top 10 signals by ROR", xaxis_title="Reporting Odds Ratio",
+                    title=chart_title, xaxis_title=x_title,
                     height=420, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                     font=dict(color="#00e9ab"), yaxis=dict(autorange="reversed"),
                     xaxis=dict(gridcolor="rgba(128,128,128,0.2)"),
@@ -868,8 +1105,9 @@ def main():
                                 st.success(f"Loaded **{clicked_drug.title()} + {partner.title()}** → switch to the **Drug Pair Lookup** tab.")
 
                 st.markdown(
-                    "🟢 **Teal nodes** = drugs in flagged signals &nbsp;|&nbsp; "
-                    "🔵 **Blue nodes** = no signals found"
+                    "<span style='color:#00e9ab'>●</span> <b>Teal nodes</b> = drugs in flagged signals &nbsp;|&nbsp; "
+                    "<span style='color:#4a6fa5'>●</span> <b>Blue nodes</b> = no signals found",
+                    unsafe_allow_html=True
                 )
             except Exception as e:
                 st.error(f"Could not render network: {e}")
@@ -935,7 +1173,7 @@ def main():
                 if dang_novel.empty:
                     st.info("No dangerous novel signals found under current filters.")
                 else:
-                    dang_novel["is_dangerous"] = dang_novel["is_dangerous"].apply(lambda x: "⚠️ Yes" if x else "")
+                    dang_novel["is_dangerous"] = dang_novel["is_dangerous"].apply(lambda x: "▲ Yes" if x else "")
                     st.dataframe(dang_novel, use_container_width=True,
                                  column_config={
                                      "ror":          st.column_config.NumberColumn("ROR",      format="%.2f"),
@@ -943,7 +1181,7 @@ def main():
                                      "ci_upper":     st.column_config.NumberColumn("CI Upper", format="%.2f"),
                                      "is_dangerous": st.column_config.TextColumn("Dangerous"),
                                  })
-                    st.download_button("⬇️ Export dangerous novel signals",
+                    st.download_button("↓ Export dangerous novel signals",
                                        data=dang_novel.to_csv(index=False).encode("utf-8"),
                                        file_name="interx_dangerous_novel.csv", mime="text/csv")
             else:
@@ -960,7 +1198,7 @@ def main():
         # ── PillScan expander ─────────────────────────────────────────────────
         # render_pill_scanner writes directly to st.session_state["my_drugs_scanned"]
         # and calls st.rerun() — it never returns a meaningful value.
-        with st.expander("📷  Scan a pill bottle to add medication", expanded=False):
+        with st.expander("Scan a pill bottle to add medication", expanded=False):
             render_pill_scanner(all_drugs, anthropic_key)
 
         # ── Scanned drugs chips ───────────────────────────────────────────────
@@ -1029,7 +1267,7 @@ def main():
             c1.metric("Drug pairs checked", n_pairs)
             c2.metric("Signals found", n_signals)
             c3.metric("Dangerous reactions", n_danger,
-                      delta="⚠️ Review" if n_danger > 0 else None, delta_color="inverse")
+                      delta="▲ Review" if n_danger > 0 else None, delta_color="inverse")
 
             if not pair_signals.empty:
                 with st.expander("View raw signal data"):
@@ -1042,7 +1280,7 @@ def main():
                         display_df = display_df.sort_values("ror", ascending=False)
                     if "is_dangerous" in display_df.columns:
                         display_df["is_dangerous"] = display_df["is_dangerous"].apply(
-                            lambda x: "⚠️ Yes" if x else "")
+                            lambda x: "▲ Yes" if x else "")
                     st.dataframe(display_df, use_container_width=True,
                                  column_config={
                                      "ror":          st.column_config.NumberColumn("ROR",      format="%.2f"),
@@ -1188,9 +1426,9 @@ def main():
                             already_added = gname in [d.lower() for d in st.session_state["my_drugs_scanned"]]
                             if already_added:
                                 st.button(f"✓ {drug_display.title()} already added", disabled=True, key=f"rxn_add_{i}")
-                            elif st.button(f"➕ Add {drug_display.title()}", key=f"rxn_add_{i}", type="primary"):
+                            elif st.button(f"+ Add {drug_display.title()}", key=f"rxn_add_{i}", type="primary"):
                                 st.session_state["my_drugs_scanned"].append(drug_display)
-                                st.toast(f"✅ {drug_display.title()} added to My Medications!", icon="💊")
+                                st.toast(f"● {drug_display.title()} added to My Medications!")
                                 st.rerun()
                 else:
                     st.info(
